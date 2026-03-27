@@ -46,6 +46,28 @@ from bot.models import BotMessage
 logger = logging.getLogger(__name__)
 
 
+def _parse_config_simulation_date(config: Any) -> Optional[date]:
+    """Normalize ``Config.agent_simulation_date`` to a past-or-today calendar date."""
+    raw = getattr(config, "agent_simulation_date", None)
+    if isinstance(raw, date):
+        d = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            d = date.fromisoformat(raw.strip()[:10])
+        except ValueError:
+            logger.warning("Invalid agent_simulation_date %r, ignoring", raw)
+            return None
+    elif raw is not None:
+        logger.warning("Unsupported agent_simulation_date type %r, ignoring", type(raw))
+        return None
+    else:
+        return None
+    if d > date.today():
+        logger.warning("agent_simulation_date %s is in the future, ignoring", d)
+        return None
+    return d
+
+
 class StockAnalysisPipeline:
     """
     股票分析主流程调度器
@@ -205,24 +227,35 @@ class StockAnalysisPipeline:
             # 获取股票名称（优先从实时行情获取真实名称）
             stock_name = self.fetcher_manager.get_stock_name(code)
 
+            # --- 历史仿真截止日（Agent as-of）；仅允许技术面 + 截断后的日线 ---
+            sim_date: Optional[date] = _parse_config_simulation_date(self.config)
+
             # Step 1: 获取实时行情（量比、换手率等）- 使用统一入口，自动故障切换
             realtime_quote = None
-            try:
-                realtime_quote = self.fetcher_manager.get_realtime_quote(code)
-                if realtime_quote:
-                    # 使用实时行情返回的真实股票名称
-                    if realtime_quote.name:
-                        stock_name = realtime_quote.name
-                    # 兼容不同数据源的字段（有些数据源可能没有 volume_ratio）
-                    volume_ratio = getattr(realtime_quote, 'volume_ratio', None)
-                    turnover_rate = getattr(realtime_quote, 'turnover_rate', None)
-                    logger.info(f"{stock_name}({code}) 实时行情: 价格={realtime_quote.price}, "
-                              f"量比={volume_ratio}, 换手率={turnover_rate}% "
-                              f"(来源: {realtime_quote.source.value if hasattr(realtime_quote, 'source') else 'unknown'})")
-                else:
-                    logger.info(f"{stock_name}({code}) 实时行情获取失败或已禁用，将使用历史数据进行分析")
-            except Exception as e:
-                logger.warning(f"{stock_name}({code}) 获取实时行情失败: {e}")
+            if sim_date:
+                logger.info(
+                    "%s(%s) 历史仿真截止 %s：跳过实时行情",
+                    stock_name or code,
+                    code,
+                    sim_date.isoformat(),
+                )
+            else:
+                try:
+                    realtime_quote = self.fetcher_manager.get_realtime_quote(code)
+                    if realtime_quote:
+                        # 使用实时行情返回的真实股票名称
+                        if realtime_quote.name:
+                            stock_name = realtime_quote.name
+                        # 兼容不同数据源的字段（有些数据源可能没有 volume_ratio）
+                        volume_ratio = getattr(realtime_quote, 'volume_ratio', None)
+                        turnover_rate = getattr(realtime_quote, 'turnover_rate', None)
+                        logger.info(f"{stock_name}({code}) 实时行情: 价格={realtime_quote.price}, "
+                                  f"量比={volume_ratio}, 换手率={turnover_rate}% "
+                                  f"(来源: {realtime_quote.source.value if hasattr(realtime_quote, 'source') else 'unknown'})")
+                    else:
+                        logger.info(f"{stock_name}({code}) 实时行情获取失败或已禁用，将使用历史数据进行分析")
+                except Exception as e:
+                    logger.warning(f"{stock_name}({code}) 获取实时行情失败: {e}")
 
             # 如果还是没有名称，使用代码作为名称
             if not stock_name:
@@ -230,15 +263,16 @@ class StockAnalysisPipeline:
 
             # Step 2: 获取筹码分布 - 使用统一入口，带熔断保护
             chip_data = None
-            try:
-                chip_data = self.fetcher_manager.get_chip_distribution(code)
-                if chip_data:
-                    logger.info(f"{stock_name}({code}) 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
-                              f"90%集中度={chip_data.concentration_90:.2%}")
-                else:
-                    logger.debug(f"{stock_name}({code}) 筹码分布获取失败或已禁用")
-            except Exception as e:
-                logger.warning(f"{stock_name}({code}) 获取筹码分布失败: {e}")
+            if not sim_date:
+                try:
+                    chip_data = self.fetcher_manager.get_chip_distribution(code)
+                    if chip_data:
+                        logger.info(f"{stock_name}({code}) 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
+                                  f"90%集中度={chip_data.concentration_90:.2%}")
+                    else:
+                        logger.debug(f"{stock_name}({code}) 筹码分布获取失败或已禁用")
+                except Exception as e:
+                    logger.warning(f"{stock_name}({code}) 获取筹码分布失败: {e}")
 
             # If agent mode is explicitly enabled, or specific agent skills are configured, use the Agent analysis pipeline.
             # NOTE: use config.agent_mode (explicit opt-in) instead of
@@ -253,18 +287,32 @@ class StockAnalysisPipeline:
                     use_agent = True
                     logger.info(f"{stock_name}({code}) Auto-enabled agent mode due to configured skills: {configured_skills}")
 
+            if sim_date:
+                use_agent = True
+                logger.info(
+                    "%s(%s) 历史仿真：强制使用 Agent 路径",
+                    stock_name,
+                    code,
+                )
+
             # Step 2.5: 基本面能力聚合（统一入口，异常降级）
             # - 失败时返回 partial/failed，不影响既有技术面/新闻链路
             # - 关闭开关时仍返回 not_supported 结构
             fundamental_context = None
-            try:
-                fundamental_context = self.fetcher_manager.get_fundamental_context(
+            if sim_date:
+                fundamental_context = self.fetcher_manager.build_failed_fundamental_context(
                     code,
-                    budget_seconds=getattr(self.config, 'fundamental_stage_timeout_seconds', 1.5),
+                    "historical_simulation_disabled",
                 )
-            except Exception as e:
-                logger.warning(f"{stock_name}({code}) 基本面聚合失败: {e}")
-                fundamental_context = self.fetcher_manager.build_failed_fundamental_context(code, str(e))
+            else:
+                try:
+                    fundamental_context = self.fetcher_manager.get_fundamental_context(
+                        code,
+                        budget_seconds=getattr(self.config, 'fundamental_stage_timeout_seconds', 1.5),
+                    )
+                except Exception as e:
+                    logger.warning(f"{stock_name}({code}) 基本面聚合失败: {e}")
+                    fundamental_context = self.fetcher_manager.build_failed_fundamental_context(code, str(e))
 
             fundamental_context = self._attach_belong_boards_to_fundamental_context(
                 code,
@@ -272,31 +320,41 @@ class StockAnalysisPipeline:
             )
 
             # P0: write-only snapshot, fail-open, no read dependency on this table.
-            try:
-                self.db.save_fundamental_snapshot(
-                    query_id=query_id,
-                    code=code,
-                    payload=fundamental_context,
-                    source_chain=fundamental_context.get("source_chain", []),
-                    coverage=fundamental_context.get("coverage", {}),
-                )
-            except Exception as e:
-                logger.debug(f"{stock_name}({code}) 基本面快照写入失败: {e}")
+            if not sim_date:
+                try:
+                    self.db.save_fundamental_snapshot(
+                        query_id=query_id,
+                        code=code,
+                        payload=fundamental_context,
+                        source_chain=fundamental_context.get("source_chain", []),
+                        coverage=fundamental_context.get("coverage", {}),
+                    )
+                except Exception as e:
+                    logger.debug(f"{stock_name}({code}) 基本面快照写入失败: {e}")
 
             # Step 3: 趋势分析（基于交易理念）— 在 Agent 分支之前执行，供两条路径共用
             trend_result: Optional[TrendAnalysisResult] = None
             try:
-                end_date = date.today()
+                from src.agent.simulation_context import truncate_ohlcv_dataframe
+
+                end_date = sim_date if sim_date else date.today()
                 start_date = end_date - timedelta(days=89)  # ~60 trading days for MA60
                 historical_bars = self.db.get_data_range(code, start_date, end_date)
-                if historical_bars:
-                    df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
-                    # Issue #234: Augment with realtime for intraday MA calculation
-                    if self.config.enable_realtime_quote and realtime_quote:
-                        df = self._augment_historical_with_realtime(df, realtime_quote, code)
-                    trend_result = self.trend_analyzer.analyze(df, code)
-                    logger.info(f"{stock_name}({code}) 趋势分析: {trend_result.trend_status.value}, "
-                              f"买入信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}")
+                df = pd.DataFrame([bar.to_dict() for bar in historical_bars]) if historical_bars else None
+                if sim_date and (df is None or df.empty):
+                    df_any, _src = self.fetcher_manager.get_daily_data(code, days=120)
+                    if df_any is not None and not df_any.empty:
+                        df = truncate_ohlcv_dataframe(df_any, sim_date)
+                if df is not None and not df.empty:
+                    if sim_date:
+                        df = truncate_ohlcv_dataframe(df, sim_date)
+                    if df is not None and not df.empty:
+                        # Issue #234: Augment with realtime for intraday MA calculation（历史仿真禁用）
+                        if not sim_date and self.config.enable_realtime_quote and realtime_quote:
+                            df = self._augment_historical_with_realtime(df, realtime_quote, code)
+                        trend_result = self.trend_analyzer.analyze(df, code)
+                        logger.info(f"{stock_name}({code}) 趋势分析: {trend_result.trend_status.value}, "
+                                  f"买入信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}")
             except Exception as e:
                 logger.warning(f"{stock_name}({code}) 趋势分析失败: {e}", exc_info=True)
 
@@ -665,7 +723,9 @@ class StockAnalysisPipeline:
         """
         try:
             from src.agent.factory import build_agent_executor
+
             report_language = normalize_report_language(getattr(self.config, "report_language", "zh"))
+            sim_cutoff = _parse_config_simulation_date(self.config)
 
             # Build executor from shared factory (ToolRegistry and SkillManager prototype are cached)
             executor = build_agent_executor(self.config, getattr(self.config, 'agent_skills', None) or None)
@@ -678,6 +738,9 @@ class StockAnalysisPipeline:
                 "report_language": report_language,
                 "fundamental_context": fundamental_context,
             }
+
+            if sim_cutoff:
+                initial_context["simulation_date"] = sim_cutoff.isoformat()
             
             if realtime_quote:
                 initial_context["realtime_quote"] = self._safe_to_dict(realtime_quote)
@@ -689,7 +752,7 @@ class StockAnalysisPipeline:
             # Agent path: inject social sentiment as news_context so both
             # executor (_build_user_message) and orchestrator (ctx.set_data)
             # can consume it through the existing news_context channel
-            if self.social_sentiment_service.is_available and is_us_stock_code(code):
+            if self.social_sentiment_service.is_available and is_us_stock_code(code) and not sim_cutoff:
                 try:
                     social_context = self.social_sentiment_service.get_social_context(code)
                     if social_context:
@@ -741,7 +804,8 @@ class StockAnalysisPipeline:
                     news_response = self.search_service.search_stock_news(
                         stock_code=code,
                         stock_name=resolved_stock_name,
-                        max_results=5
+                        max_results=5,
+                        as_of=sim_cutoff,
                     )
                     if news_response.success and news_response.results:
                         query_context = self._build_query_context(query_id=query_id)

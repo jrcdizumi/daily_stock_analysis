@@ -9,6 +9,7 @@ Tools:
 import logging
 from typing import Optional
 
+from src.agent.simulation_context import get_simulation_as_of, truncate_ohlcv_dataframe
 from src.agent.tools.registry import ToolParameter, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,8 @@ def _fetch_trend_data(stock_code: str):
     code = canonical_stock_code(stock_code)
     if not code:
         return None
-    end_date = date.today()
+    sim = get_simulation_as_of()
+    end_date = sim if sim else date.today()
     start_date = end_date - timedelta(days=89)  # ~60 trading days, mirrors pipeline Step 3
 
     # 1. Try DB
@@ -34,8 +36,11 @@ def _fetch_trend_data(stock_code: str):
         bars = db.get_data_range(code, start_date, end_date)
         if bars:
             df = pd.DataFrame([b.to_dict() for b in bars])
-            logger.debug("analyze_trend(%s): loaded %d rows from DB", stock_code, len(df))
-            return df
+            if sim:
+                df = truncate_ohlcv_dataframe(df, sim)
+            if df is not None and not df.empty:
+                logger.debug("analyze_trend(%s): loaded %d rows from DB", stock_code, len(df))
+                return df
     except Exception as e:
         logger.debug(
             "analyze_trend(%s): DB lookup failed (%s), falling back to DataFetcherManager",
@@ -47,11 +52,14 @@ def _fetch_trend_data(stock_code: str):
         manager = DataFetcherManager()
         df, _ = manager.get_daily_data(code, days=90)
         if df is not None and not df.empty:
-            logger.info(
-                "analyze_trend(%s): DB empty, loaded %d rows from DataFetcherManager",
-                stock_code, len(df)
-            )
-            return df
+            if sim:
+                df = truncate_ohlcv_dataframe(df, sim)
+            if df is not None and not df.empty:
+                logger.info(
+                    "analyze_trend(%s): DB empty, loaded %d rows from DataFetcherManager",
+                    stock_code, len(df)
+                )
+                return df
     except DataFetchError as e:
         logger.warning("analyze_trend(%s): DataFetcherManager failed: %s", stock_code, e)
     except Exception as e:
@@ -148,6 +156,10 @@ def _handle_calculate_ma(stock_code: str, periods: Optional[str] = None, days: i
 
     manager = DataFetcherManager()
     df, source = manager.get_daily_data(stock_code, days=days)
+    sim = get_simulation_as_of()
+    if sim:
+        df = truncate_ohlcv_dataframe(df, sim)
+        source = f"{source}|historical_simulation"
 
     if df is None or df.empty:
         return {"error": f"No historical data for {stock_code}"}
@@ -241,6 +253,10 @@ def _handle_get_volume_analysis(stock_code: str, days: int = 30) -> dict:
 
     manager = DataFetcherManager()
     df, source = manager.get_daily_data(stock_code, days=max(days + 20, 60))
+    sim = get_simulation_as_of()
+    if sim:
+        df = truncate_ohlcv_dataframe(df, sim)
+        source = f"{source}|historical_simulation"
 
     if df is None or df.empty:
         return {"error": f"No historical data for {stock_code}"}
@@ -358,6 +374,10 @@ def _handle_analyze_pattern(stock_code: str, days: int = 60) -> dict:
 
     manager = DataFetcherManager()
     df, source = manager.get_daily_data(stock_code, days=max(days, 120))
+    sim = get_simulation_as_of()
+    if sim:
+        df = truncate_ohlcv_dataframe(df, sim)
+        source = f"{source}|historical_simulation"
 
     if df is None or df.empty:
         return {"error": f"No historical data for {stock_code}"}

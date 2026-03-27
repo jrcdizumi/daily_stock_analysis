@@ -188,6 +188,7 @@
 | `NEWS_MAX_AGE_DAYS` | 新闻最大时效上限（天），默认 3；实际窗口 `effective_days = min(profile_days, NEWS_MAX_AGE_DAYS)`，例如 `ultra_short(1)` + `7` 仍为 `1` 天 | 可选 |
 | `BIAS_THRESHOLD` | 乖离率阈值（%），默认 5.0，超过提示不追高；强势趋势股自动放宽 | 可选 |
 | `AGENT_MODE` | 开启 Agent 策略问股模式（内部统一命名为 skill，`true`/`false`，默认 false） | 可选 |
+| `AGENT_SIMULATION_DATE` | Agent **历史仿真**截止日 `YYYY-MM-DD`（可选）：K 线与技术指标仅用到该日；新闻/综合情报仍可调搜索但按截止日时间窗与发布日过滤（Tavily 优先用日期范围）；基本面与市场指数可走 yfinance 历史截面；筹码/板块排行等仍受限。也可用 `python main.py --simulation-date` | 可选 |
 | `AGENT_LITELLM_MODEL` | Agent 主模型（可选）；留空继承 `LITELLM_MODEL`，无前缀会按 `openai/<model>` 解析 | 可选 |
 | `AGENT_SKILLS` | 激活的策略技能 id（逗号分隔），`all` 启用全部策略技能；留空时使用主默认策略 skill（内置默认是 `bull_trend`），详见 `.env.example` | 可选 |
 | `AGENT_MAX_STEPS` | Agent 最大推理步数（默认 10） | 可选 |
@@ -391,6 +392,7 @@ LITELLM_MODEL=openai/deepseek-chat
 - **Bot 命令**：`/ask` 技能分析（支持多股对比）、`/chat` 自由对话
 - **自定义策略（Skill）**：在 `strategies/` 目录下新建 YAML 文件或在自定义 skill 目录中放入 `SKILL.md` bundle，即可添加新的交易策略，无需写代码
 - **多 Agent 架构**（实验性）：设置 `AGENT_ARCH=multi` 启用 Technical → Intel → Risk → Specialist → Decision 多 Agent 级联编排，通过 `AGENT_ORCHESTRATOR_MODE` 控制深度（quick/standard/full/specialist）。其中 `strategy` / `skill` 仍作为旧值兼容并会自动归一化到 `specialist`。超时或中间阶段 JSON 解析失败时，系统会优先保留已完成阶段结果并降级生成最小可用仪表盘，避免整份报告直接退回默认占位。详见 [完整配置指南](docs/full-guide.md)
+- **历史仿真（as-of）**：设置 `AGENT_SIMULATION_DATE=YYYY-MM-DD` 或使用 `python main.py --simulation-date YYYY-MM-DD`（会临时开启 Agent 并覆盖 env）时，主流程按截止日截断日线后再跑 Agent；搜索类工具在截止日约束下仍可用（避免把「仿真」等同于全面断网）；估值类字段仍以 yfinance 历史 K 线为主并提示 `info` 可能非严格时点。用于评估策略在历史上的可解释行为，而非替代完整资金曲线回测引擎。
 
 > **注意**：配置了任意 AI API Key 后，Agent 对话功能自动可用，无需手动设置 `AGENT_MODE=true`。如需显式关闭可设置 `AGENT_MODE=false`。每次对话会产生 LLM API 调用费用。若你手动修改了 `.env` 中的模型主备配置（如 `LITELLM_MODEL` / `AGENT_LITELLM_MODEL` / `LITELLM_FALLBACK_MODELS` / `LLM_CHANNELS`），需要重启服务或触发配置重载后，新进程才会按新模型生效。
 

@@ -213,11 +213,19 @@ class AgentOrchestrator:
 
         Returns an ``AgentResult`` (same type as ``AgentExecutor.run``).
         """
-        from src.agent.executor import AgentResult
+        from src.agent.executor import (
+            AgentResult,
+            _merge_config_simulation_into_context,
+            _parse_simulation_date_from_context,
+        )
+        from src.agent.simulation_context import simulation_as_of_scope
 
-        ctx = self._build_context(task, context)
-        ctx.meta["response_mode"] = "dashboard"
-        orch_result = self._execute_pipeline(ctx, parse_dashboard=True)
+        context = _merge_config_simulation_into_context(context)
+        sim = _parse_simulation_date_from_context(context)
+        with simulation_as_of_scope(sim):
+            ctx = self._build_context(task, context)
+            ctx.meta["response_mode"] = "dashboard"
+            orch_result = self._execute_pipeline(ctx, parse_dashboard=True)
 
         return AgentResult(
             success=orch_result.success,
@@ -244,26 +252,34 @@ class AgentOrchestrator:
         ``conversation_manager``); the orchestrator focuses on multi-agent
         coordination.
         """
-        from src.agent.executor import AgentResult
-        from src.agent.conversation import conversation_manager
-
-        ctx = self._build_context(message, context)
-        ctx.session_id = session_id
-        ctx.meta["response_mode"] = "chat"
-
-        session = conversation_manager.get_or_create(session_id)
-        history = session.get_history()
-        if history:
-            ctx.meta["conversation_history"] = history
-
-        # Persist user turn
-        conversation_manager.add_message(session_id, "user", message)
-
-        orch_result = self._execute_pipeline(
-            ctx,
-            parse_dashboard=False,
-            progress_callback=progress_callback,
+        from src.agent.executor import (
+            AgentResult,
+            _merge_config_simulation_into_context,
+            _parse_simulation_date_from_context,
         )
+        from src.agent.conversation import conversation_manager
+        from src.agent.simulation_context import simulation_as_of_scope
+
+        context = _merge_config_simulation_into_context(context)
+        sim = _parse_simulation_date_from_context(context)
+        with simulation_as_of_scope(sim):
+            ctx = self._build_context(message, context)
+            ctx.session_id = session_id
+            ctx.meta["response_mode"] = "chat"
+
+            session = conversation_manager.get_or_create(session_id)
+            history = session.get_history()
+            if history:
+                ctx.meta["conversation_history"] = history
+
+            # Persist user turn
+            conversation_manager.add_message(session_id, "user", message)
+
+            orch_result = self._execute_pipeline(
+                ctx,
+                parse_dashboard=False,
+                progress_callback=progress_callback,
+            )
 
         # Persist assistant response
         if orch_result.success:
@@ -586,6 +602,8 @@ class AgentOrchestrator:
             ctx.meta["skills_requested"] = requested_skills or []
             ctx.meta["strategies_requested"] = requested_skills or []
             ctx.meta["report_language"] = normalize_report_language(context.get("report_language", "zh"))
+            if context.get("simulation_date"):
+                ctx.meta["simulation_date"] = context["simulation_date"]
 
             # Pre-populate data fields that the caller already has
             for data_key in ("realtime_quote", "daily_history", "chip_distribution",

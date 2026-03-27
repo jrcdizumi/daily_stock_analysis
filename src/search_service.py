@@ -276,6 +276,8 @@ class TavilySearchProvider(BaseSearchProvider):
         max_results: int,
         days: int = 7,
         topic: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> SearchResponse:
         """执行 Tavily 搜索"""
         try:
@@ -299,10 +301,15 @@ class TavilySearchProvider(BaseSearchProvider):
                 "max_results": max_results,
                 "include_answer": False,
                 "include_raw_content": False,
-                "days": days,  # 搜索最近天数的内容
             }
             if topic is not None:
                 search_kwargs["topic"] = topic
+            # API: start_date / end_date 与 days 二选一（按发布/更新时间过滤）
+            if start_date and end_date:
+                search_kwargs["start_date"] = start_date
+                search_kwargs["end_date"] = end_date
+            else:
+                search_kwargs["days"] = days
 
             response = client.search(
                 **search_kwargs,
@@ -350,9 +357,11 @@ class TavilySearchProvider(BaseSearchProvider):
         max_results: int = 5,
         days: int = 7,
         topic: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> SearchResponse:
         """执行 Tavily 搜索，可按调用方选择是否启用新闻 topic。"""
-        if topic is None:
+        if topic is None and not (start_date and end_date):
             return super().search(query, max_results=max_results, days=days)
 
         api_key = self._get_next_key()
@@ -367,7 +376,15 @@ class TavilySearchProvider(BaseSearchProvider):
 
         start_time = time.time()
         try:
-            response = self._do_search(query, api_key, max_results, days=days, topic=topic)
+            response = self._do_search(
+                query,
+                api_key,
+                max_results,
+                days=days,
+                topic=topic,
+                start_date=start_date,
+                end_date=end_date,
+            )
             response.search_time = time.time() - start_time
 
             if response.success:
@@ -2036,19 +2053,91 @@ class SearchService:
             search_time=response.search_time,
         )
 
+    def _filter_news_response_as_of(
+        self,
+        response: SearchResponse,
+        *,
+        as_of: date,
+        search_days: int,
+        max_results: int,
+        log_scope: str,
+    ) -> SearchResponse:
+        """Hard-filter by publish date within [as_of - window, as_of] (historical simulation)."""
+        if not response.success or not response.results:
+            return response
+
+        earliest = as_of - timedelta(days=max(0, int(search_days) - 1))
+        latest = as_of + timedelta(days=self.FUTURE_TOLERANCE_DAYS)
+
+        filtered: List[SearchResult] = []
+        dropped_unknown = 0
+        dropped_old = 0
+        dropped_future = 0
+
+        for item in response.results:
+            published = self._normalize_news_publish_date(item.published_date)
+            if published is None:
+                dropped_unknown += 1
+                continue
+            if published < earliest:
+                dropped_old += 1
+                continue
+            if published > latest:
+                dropped_future += 1
+                continue
+
+            filtered.append(
+                SearchResult(
+                    title=item.title,
+                    snippet=item.snippet,
+                    url=item.url,
+                    source=item.source,
+                    published_date=published.isoformat(),
+                )
+            )
+            if len(filtered) >= max_results:
+                break
+
+        if dropped_unknown or dropped_old or dropped_future:
+            logger.info(
+                "[新闻过滤·仿真] %s: provider=%s, total=%s, kept=%s, drop_unknown=%s, drop_old=%s, drop_future=%s, window=[%s,%s]",
+                log_scope,
+                response.provider,
+                len(response.results),
+                len(filtered),
+                dropped_unknown,
+                dropped_old,
+                dropped_future,
+                earliest.isoformat(),
+                latest.isoformat(),
+            )
+
+        return SearchResponse(
+            query=response.query,
+            results=filtered,
+            provider=response.provider,
+            success=response.success,
+            error_message=response.error_message,
+            search_time=response.search_time,
+        )
+
     def _normalize_and_limit_response(
         self,
         response: SearchResponse,
         *,
         max_results: int,
+        as_of: Optional[date] = None,
     ) -> SearchResponse:
         """Normalize parseable dates without enforcing freshness filtering."""
         if not response.success or not response.results:
             return response
 
         normalized_results: List[SearchResult] = []
-        for item in response.results[:max_results]:
+        cap_scan = max(max_results * 4, max_results + 8)
+        for item in response.results[:cap_scan]:
             normalized_date = self._normalize_news_publish_date(item.published_date)
+            if as_of is not None and normalized_date is not None and normalized_date > as_of:
+                continue
             normalized_results.append(
                 SearchResult(
                     title=item.title,
@@ -2060,6 +2149,8 @@ class SearchService:
                     ),
                 )
             )
+            if len(normalized_results) >= max_results:
+                break
 
         return SearchResponse(
             query=response.query,
@@ -2069,13 +2160,21 @@ class SearchService:
             error_message=response.error_message,
             search_time=response.search_time,
         )
+
+    @staticmethod
+    def _provider_lookback_days_when_as_of(as_of: date, search_days: int) -> int:
+        """Approximate lookback from *today* so non-Tavily engines may still retrieve old pages."""
+        start_d = as_of - timedelta(days=max(0, int(search_days) - 1))
+        span = (date.today() - start_d).days + 1
+        return max(int(search_days), min(365, span))
     
     def search_stock_news(
         self,
         stock_code: str,
         stock_name: str,
         max_results: int = 5,
-        focus_keywords: Optional[List[str]] = None
+        focus_keywords: Optional[List[str]] = None,
+        as_of: Optional[date] = None,
     ) -> SearchResponse:
         """
         搜索股票相关新闻
@@ -2085,6 +2184,7 @@ class SearchService:
             stock_name: 股票名称
             max_results: 最大返回结果数
             focus_keywords: 重点关注的关键词列表
+            as_of: 历史仿真截止日；若设置则与 Tavily ``start_date``/``end_date`` 对齐并收紧本地过滤窗口
             
         Returns:
             SearchResponse 对象
@@ -2093,6 +2193,13 @@ class SearchService:
         # 并统一受 NEWS_MAX_AGE_DAYS 上限约束。
         search_days = self._effective_news_window_days()
         provider_max_results = self._provider_request_size(max_results)
+        tavily_start: Optional[str] = None
+        tavily_end: Optional[str] = None
+        coarse_days = search_days
+        if as_of is not None:
+            start_d = as_of - timedelta(days=max(0, search_days - 1))
+            tavily_start, tavily_end = start_d.isoformat(), as_of.isoformat()
+            coarse_days = self._provider_lookback_days_when_as_of(as_of, search_days)
 
         # 构建搜索查询（优化搜索效果）
         is_foreign = self._is_foreign_stock(stock_code)
@@ -2109,7 +2216,7 @@ class SearchService:
         logger.info(
             (
                 "搜索股票新闻: %s(%s), query='%s', 时间范围: 近%s天 "
-                "(profile=%s, NEWS_MAX_AGE_DAYS=%s), 目标条数=%s, provider请求条数=%s"
+                "(profile=%s, NEWS_MAX_AGE_DAYS=%s), 目标条数=%s, provider请求条数=%s, as_of=%s"
             ),
             stock_name,
             stock_code,
@@ -2119,14 +2226,16 @@ class SearchService:
             self.news_max_age_days,
             max_results,
             provider_max_results,
+            as_of.isoformat() if as_of else None,
         )
 
-        # Check cache first
+        # Check cache first（仿真模式禁用缓存避免与 live 混用）
         cache_key = self._cache_key(query, max_results, search_days)
-        cached = self._get_cached(cache_key)
-        if cached is not None:
-            logger.info(f"使用缓存搜索结果: {stock_name}({stock_code})")
-            return cached
+        if as_of is None:
+            cached = self._get_cached(cache_key)
+            if cached is not None:
+                logger.info(f"使用缓存搜索结果: {stock_name}({stock_code})")
+                return cached
 
         # 依次尝试各个搜索引擎（若过滤后为空，继续尝试下一引擎）
         had_provider_success = False
@@ -2137,19 +2246,37 @@ class SearchService:
             search_kwargs: Dict[str, Any] = {}
             if isinstance(provider, TavilySearchProvider):
                 search_kwargs["topic"] = "news"
+                if tavily_start and tavily_end:
+                    search_kwargs["start_date"] = tavily_start
+                    search_kwargs["end_date"] = tavily_end
 
-            response = provider.search(query, provider_max_results, days=search_days, **search_kwargs)
-            filtered_response = self._filter_news_response(
-                response,
-                search_days=search_days,
-                max_results=max_results,
-                log_scope=f"{stock_code}:{provider.name}:stock_news",
+            response = provider.search(
+                query,
+                provider_max_results,
+                days=coarse_days if not isinstance(provider, TavilySearchProvider) else search_days,
+                **search_kwargs,
             )
+            if as_of is not None:
+                filtered_response = self._filter_news_response_as_of(
+                    response,
+                    as_of=as_of,
+                    search_days=search_days,
+                    max_results=max_results,
+                    log_scope=f"{stock_code}:{provider.name}:stock_news",
+                )
+            else:
+                filtered_response = self._filter_news_response(
+                    response,
+                    search_days=search_days,
+                    max_results=max_results,
+                    log_scope=f"{stock_code}:{provider.name}:stock_news",
+                )
             had_provider_success = had_provider_success or bool(response.success)
 
             if filtered_response.success and filtered_response.results:
                 logger.info(f"使用 {provider.name} 搜索成功")
-                self._put_cache(cache_key, filtered_response)
+                if as_of is None:
+                    self._put_cache(cache_key, filtered_response)
                 return filtered_response
             else:
                 if response.success and not filtered_response.results:
@@ -2235,7 +2362,8 @@ class SearchService:
         self,
         stock_code: str,
         stock_name: str,
-        max_searches: int = 3
+        max_searches: int = 3,
+        as_of: Optional[date] = None,
     ) -> Dict[str, SearchResponse]:
         """
         多维度情报搜索（同时使用多个引擎、多个维度）
@@ -2249,6 +2377,7 @@ class SearchService:
             stock_code: 股票代码
             stock_name: 股票名称
             max_searches: 最大搜索次数
+            as_of: 历史仿真截止日；设置时 Tavily 使用 ``start_date``/``end_date`` 并做本地 as-of 过滤
             
         Returns:
             {维度名称: SearchResponse} 字典
@@ -2357,11 +2486,18 @@ class SearchService:
         search_days = self._effective_news_window_days()
         target_per_dimension = 3
         provider_max_results = self._provider_request_size(target_per_dimension)
+        tavily_start: Optional[str] = None
+        tavily_end: Optional[str] = None
+        coarse_days = search_days
+        if as_of is not None:
+            start_d = as_of - timedelta(days=max(0, search_days - 1))
+            tavily_start, tavily_end = start_d.isoformat(), as_of.isoformat()
+            coarse_days = self._provider_lookback_days_when_as_of(as_of, search_days)
 
         logger.info(
             (
                 "开始多维度情报搜索: %s(%s), 时间范围: 近%s天 "
-                "(profile=%s, NEWS_MAX_AGE_DAYS=%s), 目标条数=%s, provider请求条数=%s"
+                "(profile=%s, NEWS_MAX_AGE_DAYS=%s), 目标条数=%s, provider请求条数=%s, as_of=%s"
             ),
             stock_name,
             stock_code,
@@ -2370,6 +2506,7 @@ class SearchService:
             self.news_max_age_days,
             target_per_dimension,
             provider_max_results,
+            as_of.isoformat() if as_of else None,
         )
         
         # 轮流使用不同的搜索引擎
@@ -2389,20 +2526,38 @@ class SearchService:
             
             logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
 
-            if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
+            tavily_kwargs: Dict[str, Any] = {}
+            if isinstance(provider, TavilySearchProvider):
+                if dim.get('tavily_topic') is not None:
+                    tavily_kwargs["topic"] = dim['tavily_topic']
+                if tavily_start and tavily_end:
+                    tavily_kwargs["start_date"] = tavily_start
+                    tavily_kwargs["end_date"] = tavily_end
+
+            if isinstance(provider, TavilySearchProvider) and (
+                dim.get('tavily_topic') is not None or (tavily_start and tavily_end)
+            ):
                 response = provider.search(
                     dim['query'],
                     max_results=provider_max_results,
                     days=search_days,
-                    topic=dim['tavily_topic'],
+                    **tavily_kwargs,
                 )
             else:
                 response = provider.search(
                     dim['query'],
                     max_results=provider_max_results,
-                    days=search_days,
+                    days=coarse_days,
                 )
-            if dim['strict_freshness']:
+            if as_of is not None and dim['strict_freshness']:
+                filtered_response = self._filter_news_response_as_of(
+                    response,
+                    as_of=as_of,
+                    search_days=search_days,
+                    max_results=target_per_dimension,
+                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
+                )
+            elif dim['strict_freshness']:
                 filtered_response = self._filter_news_response(
                     response,
                     search_days=search_days,
@@ -2413,6 +2568,7 @@ class SearchService:
                 filtered_response = self._normalize_and_limit_response(
                     response,
                     max_results=target_per_dimension,
+                    as_of=as_of,
                 )
             results[dim['name']] = filtered_response
             search_count += 1

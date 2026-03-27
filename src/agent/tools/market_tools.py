@@ -9,6 +9,7 @@ Tools:
 
 import logging
 
+from src.agent.simulation_context import get_simulation_as_of, simulation_tool_blocked
 from src.agent.tools.registry import ToolParameter, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,29 @@ def _get_fetcher_manager():
 
 def _handle_get_market_indices(region: str = "cn") -> dict:
     """Get major market indices."""
+    sim = get_simulation_as_of()
+    if sim:
+        from data_provider.yfinance_fetcher import YfinanceFetcher
+
+        yf = YfinanceFetcher()
+        indices = yf.get_main_indices(region=region, as_of=sim)
+        if not indices:
+            return {
+                "error": (
+                    f"历史仿真截止 {sim.isoformat()}：无法从 yfinance 获取 region={region} 的指数历史截面。"
+                ),
+                "retriable": True,
+                "simulation_as_of": sim.isoformat(),
+            }
+        return {
+            "region": region,
+            "simulation_as_of": sim.isoformat(),
+            "note": (
+                "历史仿真：主指数行情来自 yfinance 截至仿真日的最近可用交易日 K 线，非实时盘口。"
+            ),
+            "indices_count": len(indices),
+            "indices": indices,
+        }
     manager = _get_fetcher_manager()
     indices = manager.get_main_indices(region=region)
 
@@ -64,6 +88,10 @@ get_market_indices_tool = ToolDefinition(
 
 def _handle_get_sector_rankings(top_n: int = 10) -> dict:
     """Get sector performance rankings."""
+    if get_simulation_as_of():
+        return simulation_tool_blocked(
+            reason_zh="历史仿真模式下不提供行业涨跌排行（数据源为即期截面）。",
+        )
     manager = _get_fetcher_manager()
     result = manager.get_sector_rankings(n=top_n)
 

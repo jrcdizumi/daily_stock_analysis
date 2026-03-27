@@ -690,7 +690,8 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             pipeline.search_service.search_stock_news.assert_called_once_with(
                 stock_code="588200",
                 stock_name="科创芯片ETF",
-                max_results=5
+                max_results=5,
+                as_of=None,
             )
             pipeline.db.save_news_intel.assert_called_once()
             saved_kwargs = pipeline.db.save_news_intel.call_args.kwargs

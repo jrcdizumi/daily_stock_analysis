@@ -40,7 +40,7 @@ import logging
 import sys
 import time
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import List, Optional, Tuple
 
 from data_provider.base import canonical_stock_code
@@ -208,6 +208,13 @@ def parse_arguments() -> argparse.Namespace:
         '--backtest-force',
         action='store_true',
         help='强制回测（即使已有回测结果也重新计算）'
+    )
+
+    parser.add_argument(
+        '--simulation-date',
+        type=str,
+        default=None,
+        help='Agent 历史仿真截止日 YYYY-MM-DD（仅技术面+截断K线；禁联网新闻/基本面等）',
     )
 
     return parser.parse_args()
@@ -420,7 +427,7 @@ def run_full_analysis(
 
         # === Auto backtest ===
         try:
-            if getattr(config, 'backtest_enabled', False):
+            if getattr(config, 'backtest_enabled', False) and not getattr(config, "agent_simulation_date", None):
                 from src.services.backtest_service import BacktestService
 
                 logger.info("开始自动回测...")
@@ -541,6 +548,18 @@ def main() -> int:
     warnings = config.validate()
     for warning in warnings:
         logger.warning(warning)
+
+    if getattr(args, "simulation_date", None):
+        sd = str(args.simulation_date).strip()[:10]
+        try:
+            date.fromisoformat(sd)
+        except ValueError:
+            logger.error("--simulation-date 须为 YYYY-MM-DD")
+            return 2
+        config.agent_simulation_date = sd
+        if not getattr(config, "agent_mode", False):
+            config.agent_mode = True
+            logger.info("历史仿真：已自动启用 Agent 模式（agent_mode=True）")
 
     # 解析股票列表（统一为大写 Issue #355）
     stock_codes = None

@@ -16,7 +16,7 @@ YfinanceFetcher - 兜底数据源 (Priority 4)
 
 import csv
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from io import StringIO
 from typing import Optional, List, Dict, Any
 from urllib.error import HTTPError, URLError
@@ -31,7 +31,7 @@ from tenacity import (
     before_sleep_log,
 )
 
-from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, is_bse_code
+from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, is_bse_code, normalize_stock_code, _market_tag
 from .realtime_types import UnifiedRealtimeQuote, RealtimeSource
 from .us_index_mapping import get_us_index_yf_symbol, is_us_stock_code
 
@@ -51,6 +51,11 @@ except (ImportError, ModuleNotFoundError):
 import os
 
 logger = logging.getLogger(__name__)
+
+
+def _history_bar_dates(hist: pd.DataFrame):
+    """Calendar dates for each history row (timezone-safe)."""
+    return [pd.Timestamp(x).date() for x in hist.index]
 
 
 class YfinanceFetcher(BaseFetcher):
@@ -261,7 +266,14 @@ class YfinanceFetcher(BaseFetcher):
 
         return df
 
-    def _fetch_yf_ticker_data(self, yf, yf_code: str, name: str, return_code: str) -> Optional[Dict[str, Any]]:
+    def _fetch_yf_ticker_data(
+        self,
+        yf,
+        yf_code: str,
+        name: str,
+        return_code: str,
+        as_of: Optional[date] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         通过 yfinance 拉取单个指数/股票的行情数据。
 
@@ -270,17 +282,36 @@ class YfinanceFetcher(BaseFetcher):
             yf_code: yfinance 使用的代码（如 '000001.SS'、'^GSPC'）
             name: 指数显示名称
             return_code: 写入结果 dict 的 code 字段（如 'sh000001'、'SPX'）
+            as_of: 若设置，取不晚于该日期的最近一根 K 线并相对前一交易日计算涨跌幅
 
         Returns:
             行情字典，失败时返回 None
         """
         ticker = yf.Ticker(yf_code)
-        # 取近两日数据以计算涨跌幅
-        hist = ticker.history(period='2d')
-        if hist.empty:
-            return None
-        today_row = hist.iloc[-1]
-        prev_row = hist.iloc[-2] if len(hist) > 1 else today_row
+        if as_of is not None:
+            start_d = as_of - timedelta(days=420)
+            end_d = as_of + timedelta(days=1)
+            hist = ticker.history(
+                start=start_d.isoformat(),
+                end=end_d.isoformat(),
+                auto_adjust=True,
+            )
+            if hist.empty:
+                return None
+            idx_dates = _history_bar_dates(hist)
+            mask = [d <= as_of for d in idx_dates]
+            sub = hist.loc[mask]
+            if sub.empty:
+                return None
+            today_row = sub.iloc[-1]
+            prev_row = sub.iloc[-2] if len(sub) > 1 else today_row
+        else:
+            # 取近两日数据以计算涨跌幅
+            hist = ticker.history(period='2d')
+            if hist.empty:
+                return None
+            today_row = hist.iloc[-1]
+            prev_row = hist.iloc[-2] if len(hist) > 1 else today_row
         price = float(today_row['Close'])
         prev_close = float(prev_row['Close'])
         change = price - prev_close
@@ -304,7 +335,9 @@ class YfinanceFetcher(BaseFetcher):
             'amplitude': amplitude,
         }
 
-    def get_main_indices(self, region: str = "cn") -> Optional[List[Dict[str, Any]]]:
+    def get_main_indices(
+        self, region: str = "cn", as_of: Optional[date] = None
+    ) -> Optional[List[Dict[str, Any]]]:
         """
         获取主要指数行情 (Yahoo Finance)，支持 A 股与美股。
         region=us 时委托给 _get_us_main_indices。
@@ -312,7 +345,7 @@ class YfinanceFetcher(BaseFetcher):
         import yfinance as yf
 
         if region == "us":
-            return self._get_us_main_indices(yf)
+            return self._get_us_main_indices(yf, as_of=as_of)
 
         # A 股指数：akshare 代码 -> (yfinance 代码, 显示名称)
         yf_mapping = {
@@ -328,7 +361,7 @@ class YfinanceFetcher(BaseFetcher):
         try:
             for ak_code, (yf_code, name) in yf_mapping.items():
                 try:
-                    item = self._fetch_yf_ticker_data(yf, yf_code, name, ak_code)
+                    item = self._fetch_yf_ticker_data(yf, yf_code, name, ak_code, as_of=as_of)
                     if item:
                         results.append(item)
                         logger.debug(f"[Yfinance] 获取指数 {name} 成功")
@@ -344,7 +377,9 @@ class YfinanceFetcher(BaseFetcher):
 
         return None
 
-    def _get_us_main_indices(self, yf) -> Optional[List[Dict[str, Any]]]:
+    def _get_us_main_indices(
+        self, yf, as_of: Optional[date] = None
+    ) -> Optional[List[Dict[str, Any]]]:
         """获取美股主要指数行情（SPX、IXIC、DJI、VIX），复用 _fetch_yf_ticker_data"""
         # 大盘复盘所需核心美股指数
         us_indices = ['SPX', 'IXIC', 'DJI', 'VIX']
@@ -355,7 +390,9 @@ class YfinanceFetcher(BaseFetcher):
                 if not yf_symbol:
                     continue
                 try:
-                    item = self._fetch_yf_ticker_data(yf, yf_symbol, name, code)
+                    item = self._fetch_yf_ticker_data(
+                        yf, yf_symbol, name, code, as_of=as_of
+                    )
                     if item:
                         results.append(item)
                         logger.debug(f"[Yfinance] 获取美股指数 {name} 成功")
@@ -730,6 +767,109 @@ class YfinanceFetcher(BaseFetcher):
         except Exception as e:
             logger.warning(f"[Yfinance] 获取美股 {stock_code} 实时行情失败: {e}，尝试 Stooq 兜底")
             return self._get_us_stock_quote_from_stooq(stock_code)
+
+    def get_fundamental_snapshot_as_of(
+        self, stock_code: str, as_of: date
+    ) -> Optional[Dict[str, Any]]:
+        """
+        历史仿真用：拉取截至 as_of（含）的最后一根 Yahoo 日线，并尽量附带 info 中的估值字段。
+
+        注意：``info`` 中的 PE/PB/总市值等可能仍反映 Yahoo 侧当前快照，并非严格时点财报；
+        OHLCV 与涨跌幅来自历史 K 线，相对更可信。
+        """
+        import yfinance as yf
+
+        raw = (stock_code or "").strip()
+        norm = normalize_stock_code(raw)
+        yf_code = self._convert_stock_code(raw)
+        ticker = yf.Ticker(yf_code)
+        start_d = as_of - timedelta(days=420)
+        end_d = as_of + timedelta(days=1)
+        hist = ticker.history(
+            start=start_d.isoformat(),
+            end=end_d.isoformat(),
+            auto_adjust=True,
+        )
+        if hist.empty:
+            return None
+        idx_dates = _history_bar_dates(hist)
+        mask = [d <= as_of for d in idx_dates]
+        sub = hist.loc[mask]
+        if sub.empty:
+            return None
+        last = sub.iloc[-1]
+        prev = sub.iloc[-2] if len(sub) > 1 else last
+        close_v = float(last["Close"])
+        prev_c = float(prev["Close"])
+        pct = ((close_v - prev_c) / prev_c * 100) if prev_c else None
+        bar_i = sub.index[-1]
+        last_trade_date = pd.Timestamp(bar_i).date().isoformat()
+
+        pe_ratio = pb_ratio = total_mv = circ_mv = None
+        name = norm.upper()
+        info_note: Optional[str] = None
+        try:
+            info = ticker.info or {}
+            name = (
+                info.get("shortName")
+                or info.get("longName")
+                or info.get("symbol")
+                or name
+            )
+            pe_ratio = info.get("trailingPE") or info.get("forwardPE")
+            pb_ratio = info.get("priceToBook")
+            total_mv = info.get("marketCap")
+            sh_out = info.get("sharesOutstanding")
+            if sh_out and close_v:
+                circ_mv = float(sh_out) * close_v
+            info_note = (
+                "估值字段来自 Yahoo `info` 当前快照，可能与仿真日不一致；"
+                "价格口径为截至仿真日（或此前最后交易日）的历史 K 线。"
+            )
+        except Exception:
+            info_note = "未能读取 Yahoo `info`，仅返回历史 K 线截面。"
+
+        market = _market_tag(norm)
+        fundamental_context: Dict[str, Any] = {
+            "market": market,
+            "status": "partial",
+            "coverage": {
+                "simulation": True,
+                "source": "yfinance",
+                "bar_as_of": last_trade_date,
+            },
+            "valuation": {
+                "status": "ok" if pe_ratio is not None else "partial",
+                "data": {
+                    "pe_ratio": pe_ratio,
+                    "pb_ratio": pb_ratio,
+                    "total_mv": total_mv,
+                    "circ_mv": circ_mv,
+                    "close_as_of": close_v,
+                    "pct_chg_vs_prev": pct,
+                },
+            },
+            "growth": {"status": "unavailable", "data": {}},
+            "earnings": {"status": "unavailable", "data": {}},
+            "institution": {"status": "unavailable", "data": {}},
+            "capital_flow": {"status": "unavailable", "data": {}},
+            "dragon_tiger": {"status": "unavailable", "data": {}},
+            "boards": {"status": "unavailable", "data": {}},
+        }
+
+        return {
+            "code": norm.upper(),
+            "name": name,
+            "pe_ratio": pe_ratio,
+            "pb_ratio": pb_ratio,
+            "total_mv": total_mv,
+            "circ_mv": circ_mv,
+            "fundamental_context": fundamental_context,
+            "belong_boards": [],
+            "sector_rankings": {},
+            "simulation_as_of": as_of.isoformat(),
+            "fundamental_note": info_note,
+        }
 
 
 if __name__ == "__main__":

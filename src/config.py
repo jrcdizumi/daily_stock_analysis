@@ -530,6 +530,8 @@ class Config:
     agent_event_monitor_enabled: bool = False  # Enable periodic event-driven alert checks in schedule mode
     agent_event_monitor_interval_minutes: int = 5  # Polling interval for event monitor background checks
     agent_event_alert_rules_json: str = ""  # JSON array of serialized EventMonitor rules
+    # 历史仿真：Agent 截止日 YYYY-MM-DD（仅技术面+截断K线；禁联网新闻/基本面等），也可用 CLI --simulation-date
+    agent_simulation_date: Optional[str] = None
 
     # === 通知配置（可同时配置多个，全部推送）===
     
@@ -1168,6 +1170,7 @@ class Config:
                 minimum=1,
             ),
             agent_event_alert_rules_json=os.getenv('AGENT_EVENT_ALERT_RULES_JSON', ''),
+            agent_simulation_date=cls._parse_optional_iso_date(os.getenv('AGENT_SIMULATION_DATE')),
             wechat_webhook_url=os.getenv('WECHAT_WEBHOOK_URL'),
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
             telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
@@ -1672,6 +1675,16 @@ class Config:
                 value,
             )
         return normalized
+
+    @classmethod
+    def _parse_optional_iso_date(cls, value: Optional[str]) -> Optional[str]:
+        """Return YYYY-MM-DD prefix from env or None when unset."""
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s:
+            return None
+        return s[:10]
 
     @classmethod
     def _parse_news_strategy_profile(cls, value: Optional[str]) -> str:

@@ -105,8 +105,14 @@ class AgentMemory:
 
         try:
             from src.storage import get_db
+            from src.agent.simulation_context import get_simulation_as_of
+
             db = get_db()
-            records = db.get_analysis_history(code=stock_code, limit=limit)
+            sim_cutoff = get_simulation_as_of()
+            if sim_cutoff:
+                records = db.get_analysis_history_as_of(stock_code, sim_cutoff, limit=limit)
+            else:
+                records = db.get_analysis_history(code=stock_code, limit=limit)
             entries = []
             for r in records:
                 raw_result: Dict[str, Any] = {}

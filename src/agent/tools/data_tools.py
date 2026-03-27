@@ -10,10 +10,16 @@ Tools:
 """
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from threading import Lock
 from typing import Optional
 
+from data_provider.base import canonical_stock_code
+from src.agent.simulation_context import (
+    get_simulation_as_of,
+    simulation_tool_blocked,
+    truncate_ohlcv_dataframe,
+)
 from src.agent.tools.registry import ToolParameter, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -179,6 +185,58 @@ def _compact_portfolio_risk(risk: dict, top_n: int = 10) -> dict:
 
 def _handle_get_realtime_quote(stock_code: str) -> dict:
     """Get real-time stock quote."""
+    sim = get_simulation_as_of()
+    if sim:
+        code = canonical_stock_code(stock_code) or str(stock_code).strip()
+        db = _get_db()
+        lookback_start = sim - timedelta(days=400)
+        bars = db.get_data_range(code, lookback_start, sim) if code else []
+        last_bar = bars[-1] if bars else None
+        if last_bar is None:
+            manager = _get_fetcher_manager()
+            df, source = manager.get_daily_data(code, days=120)
+            df = truncate_ohlcv_dataframe(df, sim) if df is not None else None
+            if df is None or df.empty:
+                return {
+                    "error": f"历史仿真截止 {sim.isoformat()}：本地与远端均无可用日线，无法构造截面行情。",
+                    "retriable": False,
+                    "simulation_blocked": True,
+                }
+            row = df.iloc[-1]
+            close_v = float(row.get("close") or 0)
+            return {
+                "simulation_as_of": sim.isoformat(),
+                "note": "历史仿真：以下为截止日对应日线收盘（或最后可用交易日），非实时盘口。",
+                "code": code,
+                "name": code,
+                "price": close_v,
+                "change_pct": float(row["pct_chg"]) if row.get("pct_chg") is not None else None,
+                "volume": float(row["volume"]) if row.get("volume") is not None else None,
+                "open": float(row["open"]) if row.get("open") is not None else None,
+                "high": float(row["high"]) if row.get("high") is not None else None,
+                "low": float(row["low"]) if row.get("low") is not None else None,
+                "pre_close": None,
+                "volume_ratio": float(row["volume_ratio"]) if row.get("volume_ratio") is not None else None,
+                "turnover_rate": None,
+                "source": "historical_simulation",
+            }
+        return {
+            "simulation_as_of": sim.isoformat(),
+            "note": "历史仿真：以下为截止日附近最后一根已存日线，非实时盘口。",
+            "code": last_bar.code,
+            "name": last_bar.code,
+            "price": float(last_bar.close or 0),
+            "change_pct": float(last_bar.pct_chg) if last_bar.pct_chg is not None else None,
+            "volume": float(last_bar.volume) if last_bar.volume is not None else None,
+            "open": float(last_bar.open) if last_bar.open is not None else None,
+            "high": float(last_bar.high) if last_bar.high is not None else None,
+            "low": float(last_bar.low) if last_bar.low is not None else None,
+            "pre_close": None,
+            "volume_ratio": float(last_bar.volume_ratio) if last_bar.volume_ratio is not None else None,
+            "turnover_rate": None,
+            "source": "historical_simulation_db",
+        }
+
     manager = _get_fetcher_manager()
     quote = manager.get_realtime_quote(stock_code)
     if quote is None:
@@ -240,6 +298,17 @@ def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict:
     if df is None or df.empty:
         return {"error": f"No historical data available for {stock_code}"}
 
+    sim = get_simulation_as_of()
+    if sim:
+        df = truncate_ohlcv_dataframe(df, sim)
+        if df is None or df.empty:
+            return {
+                "error": f"历史仿真截止 {sim.isoformat()}：截取后无K线数据（请确认数据源覆盖该日期）。",
+                "retriable": False,
+                "simulation_blocked": True,
+            }
+        source = f"{source}|historical_simulation"
+
     # Convert DataFrame to list of dicts (last N records)
     records = df.tail(min(days, len(df))).to_dict(orient="records")
     # Ensure date is string
@@ -284,6 +353,10 @@ get_daily_history_tool = ToolDefinition(
 
 def _handle_get_chip_distribution(stock_code: str) -> dict:
     """Get chip distribution data."""
+    if get_simulation_as_of():
+        return simulation_tool_blocked(
+            reason_zh="历史仿真模式下不提供筹码分布（数据源为即期截面，存在前视偏差风险）。请仅使用 OHLCV 与技术指标。",
+        )
     manager = _get_fetcher_manager()
     chip = manager.get_chip_distribution(stock_code)
 
@@ -329,7 +402,8 @@ get_chip_distribution_tool = ToolDefinition(
 def _handle_get_analysis_context(stock_code: str) -> dict:
     """Get stored analysis context from database."""
     db = _get_db()
-    context = db.get_analysis_context(stock_code)
+    sim = get_simulation_as_of()
+    context = db.get_analysis_context(stock_code, target_date=sim or date.today())
 
     if context is None:
         return {"error": f"No analysis context in DB for {stock_code}"}
@@ -343,6 +417,8 @@ def _handle_get_analysis_context(stock_code: str) -> dict:
         else:
             safe_context[k] = v
 
+    if sim:
+        safe_context["simulation_as_of"] = sim.isoformat()
     return safe_context
 
 
@@ -369,6 +445,24 @@ get_analysis_context_tool = ToolDefinition(
 
 def _handle_get_stock_info(stock_code: str) -> dict:
     """Get stock fundamental information through unified fundamental context."""
+    sim = get_simulation_as_of()
+    if sim:
+        from data_provider.yfinance_fetcher import YfinanceFetcher
+
+        snap = YfinanceFetcher().get_fundamental_snapshot_as_of(stock_code, sim)
+        if snap is None:
+            return {
+                "error": (
+                    f"历史仿真截止 {sim.isoformat()}：yfinance 无法获取该标的截至该日的日线截面。"
+                ),
+                "retriable": True,
+                "simulation_as_of": sim.isoformat(),
+            }
+        compact = _compact_fundamental_context(snap.get("fundamental_context") or {})
+        out = {**snap, "fundamental_context": compact}
+        out["boards"] = out.get("belong_boards") or []
+        return out
+
     manager = _get_fetcher_manager()
     try:
         fundamental_context = manager.get_fundamental_context(stock_code)
@@ -442,6 +536,11 @@ def _handle_get_portfolio_snapshot(
             as_of_date = date.fromisoformat(str(as_of).strip())
         except ValueError:
             return {"error": "as_of must be YYYY-MM-DD"}
+
+    sim = get_simulation_as_of()
+    if sim:
+        if as_of_date is None or as_of_date > sim:
+            as_of_date = sim
 
     try:
         from src.services.portfolio_service import PortfolioService

@@ -10,6 +10,7 @@ Tools:
 
 import logging
 
+from src.agent.simulation_context import get_simulation_as_of, simulation_tool_blocked
 from src.agent.tools.registry import ToolParameter, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,11 @@ def _serialize_overall_backtest_summary(summary: dict, eval_window_days: int) ->
 
 def _handle_get_overall_backtest_summary(eval_window_days: int = 30) -> dict:
     """Get the overall backtest summary for the full analysis corpus."""
+    sim = get_simulation_as_of()
+    if sim:
+        return simulation_tool_blocked(
+            reason_zh=f"历史仿真（截止 {sim.isoformat()}）不提供回测汇总工具（避免事后评估数据前视偏差）。",
+        )
     try:
         svc = _get_backtest_service()
         summary = svc.get_summary(scope="overall", code=None, eval_window_days=eval_window_days)
@@ -63,6 +69,11 @@ def _handle_get_overall_backtest_summary(eval_window_days: int = 30) -> dict:
 
 def _handle_get_skill_backtest_summary(skill_id: str = "", eval_window_days: int = 30) -> dict:
     """Get a skill-scoped backtest summary when real per-skill stats exist."""
+    sim = get_simulation_as_of()
+    if sim:
+        return simulation_tool_blocked(
+            reason_zh=f"历史仿真（截止 {sim.isoformat()}）不提供技能回测汇总工具。",
+        )
     if not skill_id:
         return {
             "supported": False,

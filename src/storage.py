@@ -1297,7 +1297,34 @@ class DatabaseManager:
             ).scalars().all()
             
             return list(results)
-    
+
+    def get_analysis_history_as_of(
+        self,
+        code: str,
+        as_of: date,
+        *,
+        limit: int = 50,
+    ) -> List[AnalysisHistory]:
+        """
+        Analysis records for one symbol with created_at on or before end of ``as_of`` day.
+
+        Used by Agent memory in historical simulation to avoid future-dated history leakage.
+        """
+        cutoff_end = datetime.combine(as_of, datetime.max.time())
+        with self.get_session() as session:
+            results = session.execute(
+                select(AnalysisHistory)
+                .where(
+                    and_(
+                        AnalysisHistory.code == code,
+                        AnalysisHistory.created_at <= cutoff_end,
+                    )
+                )
+                .order_by(desc(AnalysisHistory.created_at))
+                .limit(limit)
+            ).scalars().all()
+            return list(results)
+
     def save_daily_data(
         self, 
         df: pd.DataFrame, 
@@ -1412,13 +1439,21 @@ class DatabaseManager:
         """
         if target_date is None:
             target_date = date.today()
-        # 注意：尽管入参提供了 target_date，但当前实现实际使用的是“最新两天数据”（get_latest_data），
-        # 并不会按 target_date 精确取当日/前一交易日的上下文。
-        # 因此若未来需要支持“按历史某天复盘/重算”的可解释性，这里需要调整。
-        # 该行为目前保留（按需求不改逻辑）。
-        
-        # 获取最近2天数据
-        recent_data = self.get_latest_data(code, days=2)
+
+        # Historical as-of: last two trading rows with date <= target_date (DB range query).
+        if target_date < date.today():
+            lookback_start = target_date - timedelta(days=400)
+            range_rows = self.get_data_range(code, lookback_start, target_date)
+            eligible = [row for row in range_rows if row.date <= target_date]
+            if not eligible:
+                logger.warning("未找到 %s 在 %s 及以前的日线数据", code, target_date)
+                return None
+            chunk = eligible[-2:] if len(eligible) >= 2 else eligible[-1:]
+            # 与 get_latest_data 一致：按日期降序，[0]=最近交易日
+            recent_data = list(reversed(chunk))
+        else:
+            # Live / 今日：沿用“最新两天”快照（get_latest_data）
+            recent_data = self.get_latest_data(code, days=2)
         
         if not recent_data:
             logger.warning(f"未找到 {code} 的数据")

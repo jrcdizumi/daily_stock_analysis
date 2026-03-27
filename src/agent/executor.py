@@ -17,15 +17,55 @@ same implementation.
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.runner import run_agent_loop, parse_dashboard_json
+from src.agent.simulation_context import simulation_as_of_scope
 from src.agent.tools.registry import ToolRegistry
 from src.report_language import normalize_report_language
 from src.market_context import get_market_role, get_market_guidelines
 
 logger = logging.getLogger(__name__)
+
+
+def _merge_config_simulation_into_context(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Attach ``simulation_date`` from :class:`Config` when caller omitted it."""
+    ctx: Dict[str, Any] = dict(context or {})
+    if ctx.get("simulation_date"):
+        return ctx
+    try:
+        from src.config import get_config
+        raw = getattr(get_config(), "agent_simulation_date", None)
+    except Exception:
+        raw = None
+    if raw:
+        ctx["simulation_date"] = str(raw).strip()[:10]
+    return ctx
+
+
+def _parse_simulation_date_from_context(context: Optional[Dict[str, Any]]) -> Optional[date]:
+    """Read ``simulation_date`` from executor context (ISO date string or date object)."""
+    if not context:
+        return None
+    raw = context.get("simulation_date")
+    if isinstance(raw, date):
+        d = raw
+    elif isinstance(raw, datetime):
+        d = raw.date()
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            d = date.fromisoformat(raw.strip()[:10])
+        except ValueError:
+            logger.warning("Invalid simulation_date in context %r", raw)
+            return None
+    else:
+        return None
+    if d > date.today():
+        logger.warning("simulation_date %s is in the future, ignoring", d)
+        return None
+    return d
 
 
 # ============================================================
@@ -462,40 +502,43 @@ class AgentExecutor:
         Returns:
             AgentResult with parsed dashboard or error.
         """
-        # Build system prompt with skills
-        skills_section = ""
-        if self.skill_instructions:
-            skills_section = f"## 激活的交易技能\n\n{self.skill_instructions}"
-        default_skill_policy_section = ""
-        if self.default_skill_policy:
-            default_skill_policy_section = f"\n{self.default_skill_policy}\n"
-        report_language = normalize_report_language((context or {}).get("report_language", "zh"))
-        stock_code = (context or {}).get("stock_code", "")
-        market_role = get_market_role(stock_code, report_language)
-        market_guidelines = get_market_guidelines(stock_code, report_language)
-        prompt_template = (
-            LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT
-            if self.use_legacy_default_prompt
-            else AGENT_SYSTEM_PROMPT
-        )
-        system_prompt = prompt_template.format(
-            market_role=market_role,
-            market_guidelines=market_guidelines,
-            default_skill_policy_section=default_skill_policy_section,
-            skills_section=skills_section,
-            language_section=_build_language_section(report_language),
-        )
+        context = _merge_config_simulation_into_context(context)
+        sim = _parse_simulation_date_from_context(context)
+        with simulation_as_of_scope(sim):
+            # Build system prompt with skills
+            skills_section = ""
+            if self.skill_instructions:
+                skills_section = f"## 激活的交易技能\n\n{self.skill_instructions}"
+            default_skill_policy_section = ""
+            if self.default_skill_policy:
+                default_skill_policy_section = f"\n{self.default_skill_policy}\n"
+            report_language = normalize_report_language((context or {}).get("report_language", "zh"))
+            stock_code = (context or {}).get("stock_code", "")
+            market_role = get_market_role(stock_code, report_language)
+            market_guidelines = get_market_guidelines(stock_code, report_language)
+            prompt_template = (
+                LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT
+                if self.use_legacy_default_prompt
+                else AGENT_SYSTEM_PROMPT
+            )
+            system_prompt = prompt_template.format(
+                market_role=market_role,
+                market_guidelines=market_guidelines,
+                default_skill_policy_section=default_skill_policy_section,
+                skills_section=skills_section,
+                language_section=_build_language_section(report_language),
+            )
 
-        # Build tool declarations in OpenAI format (litellm handles all providers)
-        tool_decls = self.tool_registry.to_openai_tools()
+            # Build tool declarations in OpenAI format (litellm handles all providers)
+            tool_decls = self.tool_registry.to_openai_tools()
 
-        # Initialize conversation
-        messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": self._build_user_message(task, context)},
-        ]
+            # Initialize conversation
+            messages: List[Dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": self._build_user_message(task, context)},
+            ]
 
-        return self._run_loop(messages, tool_decls, parse_dashboard=True)
+            return self._run_loop(messages, tool_decls, parse_dashboard=True)
 
     def chat(self, message: str, session_id: str, progress_callback: Optional[Callable] = None, context: Optional[Dict[str, Any]] = None) -> AgentResult:
         """Execute the agent loop for a free-form chat message.
@@ -509,6 +552,8 @@ class AgentExecutor:
         Returns:
             AgentResult with the text response.
         """
+        context = _merge_config_simulation_into_context(context)
+        sim = _parse_simulation_date_from_context(context)
         from src.agent.conversation import conversation_manager
 
         # Build system prompt with skills
@@ -577,7 +622,8 @@ class AgentExecutor:
         # Persist the user turn immediately so the session appears in history during processing
         conversation_manager.add_message(session_id, "user", message)
 
-        result = self._run_loop(messages, tool_decls, parse_dashboard=False, progress_callback=progress_callback)
+        with simulation_as_of_scope(sim):
+            result = self._run_loop(messages, tool_decls, parse_dashboard=False, progress_callback=progress_callback)
 
         # Persist assistant reply (or error note) for context continuity
         if result.success:
@@ -645,6 +691,15 @@ class AgentExecutor:
                 parts.append("输出语言: English（所有 JSON 键名保持不变，所有面向用户的文本值使用英文）")
             else:
                 parts.append("输出语言: 中文（所有 JSON 键名保持不变，所有面向用户的文本值使用中文）")
+
+            sim_raw = context.get("simulation_date")
+            if sim_raw:
+                parts.append(
+                    "\n【历史仿真模式】信息截止日："
+                    f"{sim_raw}。工具层已按该日截断 K 线/技术指标；新闻与综合情报检索仍可用，"
+                    "但只会返回不晚于截止日（及策略时间窗内）的条目；基本面与市场指数以历史截面为主，"
+                    "勿将「未标注日期」的推断当作仿真日之后才发生的已知事实。请仅依据工具返回的数据输出决策仪表盘 JSON。"
+                )
 
             # Inject pre-fetched context data to avoid redundant fetches
             if context.get("realtime_quote"):

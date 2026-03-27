@@ -10,6 +10,7 @@ Tools:
 import logging
 from typing import Optional
 
+from src.agent.simulation_context import get_simulation_as_of
 from src.agent.tools.registry import ToolParameter, ToolDefinition
 
 logger = logging.getLogger(__name__)
@@ -23,12 +24,15 @@ def _get_search_service():
 
 def _handle_search_stock_news(stock_code: str, stock_name: str) -> dict:
     """Search latest news for a stock."""
+    sim = get_simulation_as_of()
     service = _get_search_service()
 
     if not service.is_available:
         return {"error": "No search engine available (no API keys configured)"}
 
-    response = service.search_stock_news(stock_code, stock_name, max_results=5)
+    response = service.search_stock_news(
+        stock_code, stock_name, max_results=5, as_of=sim
+    )
 
     if not response.success:
         return {
@@ -37,7 +41,7 @@ def _handle_search_stock_news(stock_code: str, stock_name: str) -> dict:
             "error": response.error_message,
         }
 
-    return {
+    payload = {
         "query": response.query,
         "provider": response.provider,
         "success": True,
@@ -53,6 +57,13 @@ def _handle_search_stock_news(stock_code: str, stock_name: str) -> dict:
             for r in response.results
         ],
     }
+    if sim:
+        payload["simulation_as_of"] = sim.isoformat()
+        payload["note"] = (
+            "历史仿真：新闻已按仿真截止日收紧检索与时间窗过滤（Tavily 使用日期范围；"
+            "其他引擎依赖扩大 lookback + 本地按发布日过滤）。"
+        )
+    return payload
 
 
 search_stock_news_tool = ToolDefinition(
@@ -83,6 +94,7 @@ search_stock_news_tool = ToolDefinition(
 
 def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict:
     """Multi-dimensional intelligence search."""
+    sim = get_simulation_as_of()
     service = _get_search_service()
 
     if not service.is_available:
@@ -92,6 +104,7 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
         stock_code=stock_code,
         stock_name=stock_name,
         max_searches=5,
+        as_of=sim,
     )
 
     if not intel_results:
@@ -117,10 +130,16 @@ def _handle_search_comprehensive_intel(stock_code: str, stock_name: str) -> dict
                 ],
             }
 
-    return {
+    out = {
         "report": report,
         "dimensions": dimensions,
     }
+    if sim:
+        out["simulation_as_of"] = sim.isoformat()
+        out["note"] = (
+            "历史仿真：各维度搜索已按仿真截止日约束（见 search_service as_of 语义）。"
+        )
+    return out
 
 
 search_comprehensive_intel_tool = ToolDefinition(
