@@ -695,6 +695,40 @@ Backtesting triggers automatically after the daily analysis flow completes (non-
 | `stop_loss_trigger_rate` | Stop-loss trigger rate (only counts records with SL configured) |
 | `take_profit_trigger_rate` | Take-profit trigger rate (only counts records with TP configured) |
 
+### Historical Trade Simulation (Daily Over a Date Range)
+
+You can run "daily analysis + simulated execution" across a historical date range, then export per-stock decisions (buy/sell/hold), trade quantities, daily positions, and equity curve artifacts.
+
+```bash
+python main.py --trade-simulate \
+  --trade-sim-start 2025-10-01 \
+  --trade-sim-end 2025-10-31 \
+  --trade-sim-cash 100000 \
+  --trade-sim-stocks AAPL,MSFT,NVDA \
+  --trade-sim-exec-price close
+```
+
+Common arguments:
+
+| Argument | Description |
+|----------|-------------|
+| `--trade-simulate` | Enable historical trade simulation mode |
+| `--trade-sim-start` / `--trade-sim-end` | Simulation date range (`YYYY-MM-DD`) |
+| `--trade-sim-cash` | Initial cash (default: `100000`) |
+| `--trade-sim-stocks` | Comma-separated symbol list (higher priority than `--stocks`) |
+| `--trade-sim-exec-price` | Execution price mode: `close` or `next_open` |
+| `--trade-sim-sell-fraction` | Sell ratio (0-1, default `0.5`, supports partial sells) |
+| `--trade-sim-report-type` | Daily analysis report type: `simple/full/brief` |
+| `--trade-sim-output-dir` | Output directory (default: `outputs/trade_simulation/<timestamp>`) |
+
+Output artifacts:
+
+- `decisions.csv`: per-day, per-symbol decisions and executed quantities
+- `positions.csv`: daily position records
+- `equity_curve.csv`: daily cash/market value/total equity/cumulative PnL
+- `summary.json`: range-level summary (final equity, return, etc.)
+- `equity_curve.png`: equity and cumulative PnL line chart
+
 ---
 
 ## FastAPI API Service

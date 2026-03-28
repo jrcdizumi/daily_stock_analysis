@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### 新功能
 
 - 🤖 **Agent 历史仿真（as-of）** — 支持环境变量 `AGENT_SIMULATION_DATE=YYYY-MM-DD` 或命令行 `python main.py --simulation-date YYYY-MM-DD`（覆盖 env）。生效时强制走 Agent，日线与技术指标截断至截止日；**新闻与综合情报**在仿真日仍可调搜索，但通过 Tavily `start_date`/`end_date`（若可用）与本地发布日窗口过滤，避免未来信息泄露；**基本面 `get_stock_info`** 走 yfinance 截至仿真日的历史 K 线截面（`info` 估值字段可能仍偏「当前快照」并在返回中注明）；**主市场指数**在仿真日走 yfinance 历史截面；筹码分布、板块涨跌排行、回测汇总类工具仍禁用或拒答；组合快照 `as_of` 自动封顶到仿真日；Agent 管线保存 `news_intel` 时传入同一 `as_of`。`AgentExecutor` / `AgentOrchestrator` 通过 `ContextVar` 贯通各 tool handler。传统非 Agent 分析路径不变。
+- 📈 **历史交易仿真（区间日级）** — 新增 `python main.py --trade-simulate` 模式：支持指定时间段（如 2025-10-01 到 2025-10-31）、初始现金（默认 100000）、股票池、执行价模式（`close` / `next_open`）。系统会按交易日逐日运行分析并输出每只股票的 `buy/sell/hold` 决策与交易数量，记录每日持仓与权益曲线，导出 `decisions.csv`、`positions.csv`、`equity_curve.csv`、`summary.json`，并生成 `equity_curve.png` 盈亏折线图。
 
 ### 修复
 

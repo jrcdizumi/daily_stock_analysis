@@ -49,6 +49,7 @@ from src.core.market_review import run_market_review
 from src.webui_frontend import prepare_webui_frontend_assets
 from src.config import get_config, Config
 from src.logging_config import setup_logging
+from src.enums import ReportType
 
 
 logger = logging.getLogger(__name__)
@@ -215,6 +216,63 @@ def parse_arguments() -> argparse.Namespace:
         type=str,
         default=None,
         help='Agent 历史仿真截止日 YYYY-MM-DD（仅技术面+截断K线；禁联网新闻/基本面等）',
+    )
+
+    # === Historical trade simulation ===
+    parser.add_argument(
+        '--trade-simulate',
+        action='store_true',
+        help='运行历史交易仿真（按日期区间逐日分析并执行买卖）',
+    )
+    parser.add_argument(
+        '--trade-sim-start',
+        type=str,
+        default=None,
+        help='历史交易仿真开始日期 YYYY-MM-DD',
+    )
+    parser.add_argument(
+        '--trade-sim-end',
+        type=str,
+        default=None,
+        help='历史交易仿真结束日期 YYYY-MM-DD',
+    )
+    parser.add_argument(
+        '--trade-sim-cash',
+        type=float,
+        default=100000.0,
+        help='历史交易仿真初始现金（默认 100000）',
+    )
+    parser.add_argument(
+        '--trade-sim-stocks',
+        type=str,
+        default=None,
+        help='历史交易仿真股票列表（逗号分隔，优先于 --stocks）',
+    )
+    parser.add_argument(
+        '--trade-sim-exec-price',
+        type=str,
+        choices=['close', 'next_open'],
+        default='close',
+        help='历史交易仿真执行价模式：close 或 next_open（默认 close）',
+    )
+    parser.add_argument(
+        '--trade-sim-sell-fraction',
+        type=float,
+        default=0.5,
+        help='历史交易仿真卖出比例（0-1，默认 0.5）',
+    )
+    parser.add_argument(
+        '--trade-sim-report-type',
+        type=str,
+        default='simple',
+        choices=['simple', 'full', 'brief'],
+        help='历史交易仿真每日分析使用的报告类型（默认 simple）',
+    )
+    parser.add_argument(
+        '--trade-sim-output-dir',
+        type=str,
+        default=None,
+        help='历史交易仿真输出目录（默认 outputs/trade_simulation/<timestamp>）',
     )
 
     return parser.parse_args()
@@ -615,6 +673,103 @@ def main() -> int:
         return 0
 
     try:
+        # 模式0: 历史交易仿真
+        if getattr(args, 'trade_simulate', False):
+            logger.info("模式: 历史交易仿真")
+
+            if not getattr(args, 'trade_sim_start', None) or not getattr(args, 'trade_sim_end', None):
+                logger.error("--trade-simulate 需要同时提供 --trade-sim-start 和 --trade-sim-end（YYYY-MM-DD）")
+                return 2
+
+            try:
+                start_date = date.fromisoformat(str(args.trade_sim_start).strip()[:10])
+                end_date = date.fromisoformat(str(args.trade_sim_end).strip()[:10])
+            except ValueError:
+                logger.error("--trade-sim-start / --trade-sim-end 须为 YYYY-MM-DD")
+                return 2
+
+            if args.trade_sim_cash <= 0:
+                logger.error("--trade-sim-cash 必须 > 0")
+                return 2
+
+            if not (0 <= float(args.trade_sim_sell_fraction) <= 1):
+                logger.error("--trade-sim-sell-fraction 必须在 0 到 1 之间")
+                return 2
+
+            sim_stock_codes = None
+            if getattr(args, 'trade_sim_stocks', None):
+                sim_stock_codes = [
+                    canonical_stock_code(c)
+                    for c in str(args.trade_sim_stocks).split(',')
+                    if (c or '').strip()
+                ]
+            elif stock_codes:
+                sim_stock_codes = stock_codes
+            else:
+                sim_stock_codes = config.stock_list
+
+            sim_stock_codes = [c for c in sim_stock_codes if c]
+            if not sim_stock_codes:
+                logger.error("历史交易仿真未提供有效股票列表，请使用 --trade-sim-stocks 或 --stocks 或配置 STOCK_LIST")
+                return 2
+
+            report_type = ReportType.from_str(getattr(args, 'trade_sim_report_type', 'simple'))
+
+            from src.services.historical_trade_simulation_service import HistoricalTradeSimulationService
+            from src.services.simulation_export_service import SimulationExportService
+            from src.services.simulation_plot_service import SimulationPlotService
+
+            run_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_dir = args.trade_sim_output_dir or os.path.join('outputs', 'trade_simulation', run_ts)
+
+            service = HistoricalTradeSimulationService(config=config)
+            output = service.run(
+                stock_codes=sim_stock_codes,
+                start_date=start_date,
+                end_date=end_date,
+                initial_cash=float(args.trade_sim_cash),
+                execution_price_mode=str(args.trade_sim_exec_price),
+                sell_fraction=float(args.trade_sim_sell_fraction),
+                report_type=report_type,
+            )
+
+            exported = SimulationExportService().export(
+                output_dir=output_dir,
+                decisions=output.decisions,
+                positions=output.positions,
+                equity_curve=output.equity_curve,
+                summary=output.summary,
+            )
+            chart_path = SimulationPlotService().plot(output_dir=output_dir, equity_curve=output.equity_curve)
+
+            logger.info(
+                "历史交易仿真完成: period=%s..%s stocks=%s initial_cash=%.2f final_equity=%.2f pnl=%.2f (%.2f%%)",
+                output.summary.get('start_date'),
+                output.summary.get('end_date'),
+                ','.join(output.summary.get('stock_codes', [])),
+                float(output.summary.get('initial_cash', 0.0)),
+                float(output.summary.get('final_equity', 0.0)),
+                float(output.summary.get('pnl', 0.0)),
+                float(output.summary.get('pnl_pct', 0.0)),
+            )
+            logger.info("输出文件: %s", exported)
+            logger.info("盈亏折线图: %s", chart_path)
+
+            if output.equity_curve:
+                logger.info("每日权益曲线（首尾 5 天）")
+                head_rows = output.equity_curve[:5]
+                tail_rows = output.equity_curve[-5:] if len(output.equity_curve) > 5 else []
+                preview_rows = head_rows + ([{"date": "...", "total_equity": "...", "cumulative_pnl": "..."}] if tail_rows else []) + tail_rows
+                for row in preview_rows:
+                    logger.info(
+                        "date=%s total_equity=%s cumulative_pnl=%s",
+                        row.get('date'),
+                        row.get('total_equity'),
+                        row.get('cumulative_pnl'),
+                    )
+
+            return 0
+
         # 模式0: 回测
         if getattr(args, 'backtest', False):
             logger.info("模式: 回测")

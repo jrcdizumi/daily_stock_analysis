@@ -846,6 +846,40 @@ python main.py --debug
 | `stop_loss_trigger_rate` | 止损触发率（仅统计配置了止损的记录） |
 | `take_profit_trigger_rate` | 止盈触发率（仅统计配置了止盈的记录） |
 
+### 历史交易仿真（区间日级）
+
+可通过命令行在指定历史区间执行“每日分析 + 仿真交易”，并输出每只股票当日决策（买入/卖出/持有）、交易数量、每日持仓和权益曲线。
+
+```bash
+python main.py --trade-simulate \
+  --trade-sim-start 2025-10-01 \
+  --trade-sim-end 2025-10-31 \
+  --trade-sim-cash 100000 \
+  --trade-sim-stocks AAPL,MSFT,NVDA \
+  --trade-sim-exec-price close
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|------|------|
+| `--trade-simulate` | 启用历史交易仿真模式 |
+| `--trade-sim-start` / `--trade-sim-end` | 仿真时间区间（`YYYY-MM-DD`） |
+| `--trade-sim-cash` | 初始现金（默认 `100000`） |
+| `--trade-sim-stocks` | 仿真股票列表（逗号分隔），优先级高于 `--stocks` |
+| `--trade-sim-exec-price` | 执行价模式：`close` 或 `next_open` |
+| `--trade-sim-sell-fraction` | 卖出比例（0-1，默认 `0.5`，支持部分卖出） |
+| `--trade-sim-report-type` | 每日分析报告类型：`simple/full/brief` |
+| `--trade-sim-output-dir` | 输出目录（默认 `outputs/trade_simulation/<timestamp>`） |
+
+输出产物：
+
+- `decisions.csv`：每日每股交易决策与成交数量
+- `positions.csv`：每日持仓记录
+- `equity_curve.csv`：每日现金/市值/总权益/累计盈亏
+- `summary.json`：区间汇总（最终权益、收益率等）
+- `equity_curve.png`：权益与累计盈亏折线图
+
 ---
 
 ## FastAPI API 服务
