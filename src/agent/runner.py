@@ -15,6 +15,7 @@ Design goals:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
@@ -591,7 +592,8 @@ def _execute_tools(
         if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0:
             pool = ThreadPoolExecutor(max_workers=1)
             try:
-                future = pool.submit(_exec_single, tc)
+                ctx = contextvars.copy_context()
+                future = pool.submit(ctx.run, _exec_single, tc)
                 try:
                     _, result_str, success, dur, cached = future.result(timeout=tool_wait_timeout_seconds)
                 except FuturesTimeoutError:
@@ -633,7 +635,8 @@ def _execute_tools(
         pool = ThreadPoolExecutor(max_workers=min(len(tool_calls), 5))
         timeout_triggered = False
         try:
-            futures = {pool.submit(_exec_single, tc): tc for tc in tool_calls}
+            ctx = contextvars.copy_context()
+            futures = {pool.submit(ctx.run, _exec_single, tc): tc for tc in tool_calls}
             pending = set(futures)
             for future in as_completed(
                 futures,

@@ -14,6 +14,7 @@ A股自选股智能分析系统 - 异步任务队列
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import threading
 import uuid
@@ -384,7 +385,10 @@ class AnalysisTaskQueue:
                 self._analyzing_stocks[dedupe_key] = task_id
 
                 try:
+                    # 复制上下文以支持历史仿真（如果未来需要）
+                    ctx = contextvars.copy_context()
                     future = self.executor.submit(
+                        ctx.run,
                         self._execute_task,
                         task_id,
                         stock_code,

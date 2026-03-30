@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -92,8 +93,10 @@ class TaskService:
 
         task_id = f"{code}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
 
-        # 提交到线程池
+        # 提交到线程池（复制上下文以支持历史仿真）
+        ctx = contextvars.copy_context()
         self.executor.submit(
+            ctx.run,
             self._run_analysis,
             code,
             task_id,

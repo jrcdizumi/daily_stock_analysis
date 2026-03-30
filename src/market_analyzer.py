@@ -252,6 +252,15 @@ class MarketAnalyzer:
         # 按 region 使用不同的新闻搜索词
         search_queries = self.profile.news_queries
         
+        # 历史仿真模式：从 config 获取 as_of 日期
+        sim_date = None
+        if hasattr(self.config, 'agent_simulation_date') and self.config.agent_simulation_date:
+            from datetime import datetime
+            try:
+                sim_date = datetime.fromisoformat(str(self.config.agent_simulation_date)).date()
+            except Exception:
+                pass
+        
         try:
             logger.info("[大盘] 开始搜索市场新闻...")
             
@@ -262,7 +271,8 @@ class MarketAnalyzer:
                     stock_code="market",
                     stock_name=market_name,
                     max_results=3,
-                    focus_keywords=query.split()
+                    focus_keywords=query.split(),
+                    as_of=sim_date,
                 )
                 if response and response.results:
                     all_news.extend(response.results)

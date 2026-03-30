@@ -11,6 +11,7 @@ A股自选股智能分析系统 - 核心分析流水线
 4. 提供股票分析的核心功能
 """
 
+import contextvars
 import logging
 import time
 import uuid
@@ -170,8 +171,8 @@ class StockAnalysisPipeline:
         """
         stock_name = code
         try:
-            # 首先获取股票名称
-            stock_name = self.fetcher_manager.get_stock_name(code)
+            # 首先获取股票名称（对于批量获取，默认不触发实时行情）
+            stock_name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
 
             today = date.today()
             # 注意：这里用自然日 date.today() 做“断点续传”判断。
@@ -224,11 +225,11 @@ class StockAnalysisPipeline:
             AnalysisResult 或 None（如果分析失败）
         """
         try:
-            # 获取股票名称（优先从实时行情获取真实名称）
-            stock_name = self.fetcher_manager.get_stock_name(code)
-
             # --- 历史仿真截止日（Agent as-of）；仅允许技术面 + 截断后的日线 ---
             sim_date: Optional[date] = _parse_config_simulation_date(self.config)
+            
+            # 获取股票名称（历史仿真模式下禁止从实时行情获取，避免污染）
+            stock_name = self.fetcher_manager.get_stock_name(code, allow_realtime=(sim_date is None))
 
             # Step 1: 获取实时行情（量比、换手率等）- 使用统一入口，自动故障切换
             realtime_quote = None
@@ -376,11 +377,12 @@ class StockAnalysisPipeline:
             if self.search_service.is_available:
                 logger.info(f"{stock_name}({code}) 开始多维度情报搜索...")
 
-                # 使用多维度搜索（最多5次搜索）
+                # 使用多维度搜索（最多5次搜索），历史仿真模式下传递截止日期
                 intel_results = self.search_service.search_comprehensive_intel(
                     stock_code=code,
                     stock_name=stock_name,
-                    max_searches=5
+                    max_searches=5,
+                    as_of=sim_date,
                 )
 
                 # 格式化情报报告
@@ -1298,10 +1300,12 @@ class StockAnalysisPipeline:
         
         # 使用线程池并发处理
         # 注意：max_workers 设置较低（默认3）以避免触发反爬
+        ctx = contextvars.copy_context()
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # 提交任务
+            # 提交任务（复制上下文以支持历史仿真）
             future_to_code = {
                 executor.submit(
+                    ctx.run,
                     self.process_single_stock,
                     code,
                     skip_analysis=dry_run,

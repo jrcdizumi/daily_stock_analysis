@@ -316,7 +316,12 @@ class TavilySearchProvider(BaseSearchProvider):
             )
             
             # 记录原始响应到日志
-            logger.info(f"[Tavily] 搜索完成，query='{query}', 返回 {len(response.get('results', []))} 条结果")
+            date_range_info = ""
+            if start_date and end_date:
+                date_range_info = f", 日期范围: {start_date} ~ {end_date}"
+            elif "days" in search_kwargs:
+                date_range_info = f", 最近 {search_kwargs['days']} 天"
+            logger.info(f"[Tavily] 搜索完成，query='{query}'{date_range_info}, 返回 {len(response.get('results', []))} 条结果")
             logger.debug(f"[Tavily] 原始响应: {response}")
             
             # 解析结果
@@ -2067,7 +2072,8 @@ class SearchService:
             return response
 
         earliest = as_of - timedelta(days=max(0, int(search_days) - 1))
-        latest = as_of + timedelta(days=self.FUTURE_TOLERANCE_DAYS)
+        # 历史仿真模式：严格限制，不允许未来新闻（FUTURE_TOLERANCE_DAYS 仅用于实时场景）
+        latest = as_of
 
         filtered: List[SearchResult] = []
         dropped_unknown = 0
@@ -2213,10 +2219,13 @@ class SearchService:
             # 默认主查询：股票名称 + 核心关键词
             query = f"{stock_name} {stock_code} 股票 最新消息"
 
+        tavily_range_info = ""
+        if tavily_start and tavily_end:
+            tavily_range_info = f", Tavily日期范围=[{tavily_start},{tavily_end}]"
         logger.info(
             (
                 "搜索股票新闻: %s(%s), query='%s', 时间范围: 近%s天 "
-                "(profile=%s, NEWS_MAX_AGE_DAYS=%s), 目标条数=%s, provider请求条数=%s, as_of=%s"
+                "(profile=%s, NEWS_MAX_AGE_DAYS=%s), 目标条数=%s, provider请求条数=%s, as_of=%s%s"
             ),
             stock_name,
             stock_code,
@@ -2227,6 +2236,7 @@ class SearchService:
             max_results,
             provider_max_results,
             as_of.isoformat() if as_of else None,
+            tavily_range_info,
         )
 
         # Check cache first（仿真模式禁用缓存避免与 live 混用）
@@ -2549,7 +2559,8 @@ class SearchService:
                     max_results=provider_max_results,
                     days=coarse_days,
                 )
-            if as_of is not None and dim['strict_freshness']:
+            # 历史仿真模式：所有维度都需要严格过滤，忽略 strict_freshness
+            if as_of is not None:
                 filtered_response = self._filter_news_response_as_of(
                     response,
                     as_of=as_of,

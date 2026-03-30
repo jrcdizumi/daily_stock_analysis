@@ -50,6 +50,7 @@ class HistoricalTradeSimulationService:
 
             self.stock_repo = StockRepository()
         self._analyze_callable = analyze_callable
+        self._fetcher_manager = None
 
     def run(
         self,
@@ -287,6 +288,12 @@ class HistoricalTradeSimulationService:
 
         for code in stock_codes:
             bars = self.stock_repo.get_range(code, start_date, ext_end)
+            
+            if not bars:
+                logger.info(f"{code} 数据库中无数据，尝试从数据源获取...")
+                self._fetch_and_save_data(code, start_date, ext_end)
+                bars = self.stock_repo.get_range(code, start_date, ext_end)
+            
             price_map[code] = {bar.date: bar for bar in bars}
         return price_map
 
@@ -486,3 +493,35 @@ class HistoricalTradeSimulationService:
         last_day = max(dates)
         bar = bars_by_date[last_day]
         return float(bar.close) if bar.close is not None else None
+
+    def _fetch_and_save_data(self, code: str, start_date: date, end_date: date) -> None:
+        """从数据源获取历史数据并保存到数据库
+        
+        为了计算技术指标（MA30、MACD等），会往前多获取60天数据
+        """
+        if self._fetcher_manager is None:
+            from data_provider import DataFetcherManager
+            self._fetcher_manager = DataFetcherManager()
+        
+        try:
+            from src.storage import DatabaseManager
+            db = DatabaseManager.get_instance()
+            
+            fetch_start = start_date - timedelta(days=60)
+            days_needed = (end_date - fetch_start).days
+            logger.info(f"从数据源获取 {code} 的历史数据（{fetch_start.strftime('%Y-%m-%d')} 到 {end_date.strftime('%Y-%m-%d')}，约 {days_needed} 天，额外60天用于计算技术指标）...")
+            
+            df, source_name = self._fetcher_manager.get_daily_data(
+                code,
+                start_date=fetch_start.strftime('%Y-%m-%d'),
+                end_date=end_date.strftime('%Y-%m-%d')
+            )
+            
+            if df is None or df.empty:
+                logger.warning(f"{code} 从数据源获取数据失败")
+                return
+            
+            saved_count = db.save_daily_data(df, code, source_name)
+            logger.info(f"{code} 历史数据保存成功（来源: {source_name}，新增 {saved_count} 条）")
+        except Exception as e:
+            logger.warning(f"{code} 获取历史数据失败: {e}")
